@@ -1,0 +1,45 @@
+name: Run Telegram voice bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: telegram-voice-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      SESSION_STRING: ${{ secrets.SESSION_STRING }}
+      SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
+      TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+      SOURCE_REQUEST_PREFIX: ${{ vars.SOURCE_REQUEST_PREFIX || 'يوت' }}
+      SOURCE_WAIT_SECONDS: ${{ vars.SOURCE_WAIT_SECONDS || '120' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system audio dependency
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - name: Start bot
+        shell: bash
+        run: |
+          # Restart the bot every 5 hours and 30 minutes, or immediately
+          # after an unexpected exit. GitHub Actions will stop the job at
+          # its platform limit, then the schedule starts it again.
+          while true; do
+            timeout --signal=TERM 19800 python bot.py
+            exit_code=$?
+            echo "bot.py exited with code ${exit_code}; restarting in 10 seconds"
+            sleep 10
+          done
