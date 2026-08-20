@@ -52,6 +52,8 @@ SOURCE_WAIT_SECONDS = int(os.getenv("SOURCE_WAIT_SECONDS", "120"))
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "100"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_DIR = Path("sessions")
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def is_audio_message(message: Any) -> bool:
@@ -82,7 +84,7 @@ class VoiceMusicBot:
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            workdir="sessions",
+            workdir=str(SESSION_DIR),
         )
         self.user = TelegramClient(
             StringSession(SESSION_STRING),
