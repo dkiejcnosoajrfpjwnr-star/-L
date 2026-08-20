@@ -18,10 +18,7 @@ jobs:
       API_HASH: ${{ secrets.API_HASH }}
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       SESSION_STRING: ${{ secrets.SESSION_STRING }}
-      SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
       TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
-      SOURCE_REQUEST_PREFIX: ${{ vars.SOURCE_REQUEST_PREFIX || 'يوت' }}
-      SOURCE_WAIT_SECONDS: ${{ vars.SOURCE_WAIT_SECONDS || '120' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
