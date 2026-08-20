@@ -15,13 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from pyrogram import Client as PyrogramClient
-from pyrogram import filters
-from pyrogram.handlers import MessageHandler
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pytgcalls import PyTgCalls
 from pytgcalls.types import AudioQuality, MediaStream
-from telethon import TelegramClient
+from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
 
 load_dotenv()
@@ -78,18 +74,21 @@ def media_from_message(message: Any) -> Any | None:
 
 def media_filename(message: Any) -> str:
     media = media_from_message(message)
-    name = getattr(media, "file_name", None) or f"media_{message.id}.mp4"
+    message_file = getattr(message, "file", None)
+    name = (
+        getattr(media, "file_name", None)
+        or getattr(message_file, "name", None)
+        or f"media_{message.id}.mp4"
+    )
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", name)[:120]
 
 
 class GroupMusicBot:
     def __init__(self) -> None:
-        self.bot = PyrogramClient(
-            "bot",
+        self.bot = TelegramClient(
+            str(SESSION_DIR / "bot"),
             api_id=API_ID,
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            workdir=str(SESSION_DIR),
         )
         self.user = TelegramClient(
             StringSession(SESSION_STRING),
@@ -107,29 +106,28 @@ class GroupMusicBot:
 
     async def is_admin(self, user_id: int) -> bool:
         try:
-            member = await self.bot.get_chat_member(TARGET_CHAT_ID, user_id)
-            status = str(member.status).lower()
-            return status.endswith("owner") or status.endswith("administrator")
+            permissions = await self.bot.get_permissions(TARGET_CHAT_ID, user_id)
+            return bool(permissions.is_admin or permissions.is_creator)
         except Exception:
             log.exception("Could not check group admin status")
             return False
 
     async def get_reply_media(self, message: Any) -> Any | None:
-        reply = message.reply_to_message
-        if reply is None and message.reply_to_message_id:
-            reply = await self.bot.get_messages(
-                TARGET_CHAT_ID, message.reply_to_message_id
-            )
+        reply = await message.get_reply_message()
         return reply if reply and media_from_message(reply) else None
 
     async def download_media(self, message: Any) -> Path:
         media = media_from_message(message)
-        size = int(getattr(media, "file_size", 0) or 0)
+        size = int(
+            getattr(media, "file_size", None)
+            or getattr(media, "size", 0)
+            or 0
+        )
         if size > MAX_MEDIA_MB * 1024 * 1024:
             raise ValueError(f"حجم الملف أكبر من {MAX_MEDIA_MB} ميغابايت.")
 
         path = DOWNLOAD_DIR / f"{message.id}_{media_filename(message)}"
-        downloaded = await self.bot.download_media(message, file_name=str(path))
+        downloaded = await self.bot.download_media(message, file=str(path))
         if not downloaded or not path.exists():
             raise RuntimeError("فشل تنزيل الملف من تيليجرام.")
         return path
@@ -204,16 +202,17 @@ class GroupMusicBot:
             self.current = None
         return had_media
 
-    async def handle_message(self, _client: Any, message: Any) -> None:
-        if not message.from_user or not await self.is_admin(message.from_user.id):
+    async def handle_message(self, event: Any) -> None:
+        message = event.message
+        if not event.sender_id or not await self.is_admin(event.sender_id):
             return
 
-        text = (message.text or "").strip()
+        text = (event.raw_text or "").strip()
         command = clean_command(text)
 
         if command in STOP_WORDS:
             stopped = await self.stop_playback()
-            await message.reply_text(
+            await event.reply(
                 "تم إيقاف التشغيل وتفريغ القائمة."
                 if stopped
                 else "لا يوجد تشغيل حاليًا."
@@ -222,54 +221,49 @@ class GroupMusicBot:
 
         if command in STATUS_WORDS:
             if self.current:
-                await message.reply_text(f"يعمل الآن: {self.current.name}")
+                await event.reply(f"يعمل الآن: {self.current.name}")
             elif not self.queue.empty():
-                await message.reply_text("لا يوجد ملف يعمل حاليًا، توجد ملفات في القائمة.")
+                await event.reply("لا يوجد ملف يعمل حاليًا، توجد ملفات في القائمة.")
             else:
-                await message.reply_text("القائمة فارغة.")
+                await event.reply("القائمة فارغة.")
             return
 
         if command not in PLAY_WORDS:
             if command in {"/start", "start"}:
-                await message.reply_text(
+                await event.reply(
                     "أهلًا بك في بوت ميوزك\n"
                     "لل تشغيل: رد على فيديو أو صوت بكلمة شغل\n"
                     "للإيقاف: اكتب ايقاف",
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("مطور البوت", url=DEVELOPER_URL)]]
-                    ),
+                    buttons=[[Button.url("مطور البوت", DEVELOPER_URL)]],
                 )
             return
 
         media_message = await self.get_reply_media(message)
         if not media_message:
-            await message.reply_text("يجب كتابة شغل كرد على فيديو أو ملف صوتي.")
+            await event.reply("يجب كتابة شغل كرد على فيديو أو ملف صوتي.")
             return
 
-        status = await message.reply_text("جاري تحميل الملف وإضافته إلى القائمة...")
+        status = await event.reply("جاري تحميل الملف وإضافته إلى القائمة...")
         try:
             path = await self.download_media(media_message)
             self.stop_requested = False
             await self.queue.put(path)
             if self.player_task is None or self.player_task.done():
                 self.player_task = asyncio.create_task(self.player_loop())
-            await status.edit_text("تمت إضافة الملف، وسيعمل تلقائيًا بالترتيب.")
+            await status.edit("تمت إضافة الملف، وسيعمل تلقائيًا بالترتيب.")
         except Exception:
             log.exception("Download failed")
-            await status.edit_text("فشل تحميل الملف. تأكد من صلاحيات البوت وحجم الملف.")
+            await status.edit("فشل تحميل الملف. تأكد من صلاحيات البوت وحجم الملف.")
 
     async def run(self) -> None:
-        self.bot.add_handler(
-            # A group-only text handler keeps commands out of private chats.
-            MessageHandler(
-                self.handle_message,
-                filters.chat(TARGET_CHAT_ID) & filters.group & filters.text,
-            )
+        self.bot.add_event_handler(
+            self.handle_message,
+            events.NewMessage(chats=TARGET_CHAT_ID),
         )
         await self.user.connect()
         if not await self.user.is_user_authorized():
             raise RuntimeError("SESSION_STRING غير مصادق عليه.")
-        await self.bot.start()
+        await self.bot.start(bot_token=BOT_TOKEN)
         self.calls = PyTgCalls(self.user)
         await self.calls.start()
         log.info("Music bot is running in target group %s", TARGET_CHAT_ID)
@@ -280,7 +274,7 @@ class GroupMusicBot:
             if self.calls:
                 with contextlib.suppress(Exception):
                     await self.calls.stop()
-            await self.bot.stop()
+            await self.bot.disconnect()
             await self.user.disconnect()
 
 
