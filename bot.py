@@ -1,8 +1,7 @@
-"""Telegram voice-chat music bot.
+"""Group-only Telegram music bot.
 
-The bot account handles commands and uploads the downloaded audio visibly as a
-bot. A Telethon user session is used only for reading the source chat and
-joining the target voice chat, which Telegram does not allow bot accounts to do.
+Admins reply to a video/audio with "شغل". The bot downloads the media, queues
+it, and the Telethon user session plays its audio in the target voice chat.
 """
 
 from __future__ import annotations
@@ -12,16 +11,17 @@ import contextlib
 import logging
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from pyrogram import Client as PyrogramClient
 from pyrogram import filters
+from pyrogram.handlers import MessageHandler
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pytgcalls import PyTgCalls
 from pytgcalls.types import AudioQuality, MediaStream
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 load_dotenv()
@@ -30,13 +30,13 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("voice-bot")
+log = logging.getLogger("music-bot")
 
 
 def required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
+        raise RuntimeError(f"Missing required secret: {name}")
     return value
 
 
@@ -44,40 +44,45 @@ API_ID = int(required("API_ID"))
 API_HASH = required("API_HASH")
 BOT_TOKEN = required("BOT_TOKEN")
 SESSION_STRING = required("SESSION_STRING")
-SOURCE_CHAT_ID = int(required("SOURCE_CHAT_ID"))
 TARGET_CHAT_ID = int(required("TARGET_CHAT_ID"))
-SOURCE_REQUEST_PREFIX = os.getenv("SOURCE_REQUEST_PREFIX", "يوت").strip()
-SOURCE_DOWNLOADER_USERNAME = "w60ybot"
-SOURCE_WAIT_SECONDS = int(os.getenv("SOURCE_WAIT_SECONDS", "120"))
-MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "100"))
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DEVELOPER_URL = os.getenv("DEVELOPER_URL", "https://t.me/c3cccc3c")
+MAX_MEDIA_MB = int(os.getenv("MAX_MEDIA_MB", "200"))
+
+DOWNLOAD_DIR = Path("downloads")
 SESSION_DIR = Path("sessions")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
+PLAY_WORDS = {"شغل", "تشغيل", "play", "/شغل", "/تشغيل", "/play"}
+STOP_WORDS = {"ايقاف", "إيقاف", "وقف", "stop", "/ايقاف", "/إيقاف", "/وقف", "/stop"}
+STATUS_WORDS = {"حالة", "status", "/حالة", "/status"}
 
-def is_audio_message(message: Any) -> bool:
-    if getattr(message, "voice", None) or getattr(message, "audio", None):
-        return True
+
+def clean_command(text: str) -> str:
+    return text.strip().split(maxsplit=1)[0].lower()
+
+
+def media_from_message(message: Any) -> Any | None:
+    if getattr(message, "video", None):
+        return message.video
+    if getattr(message, "audio", None):
+        return message.audio
+    if getattr(message, "voice", None):
+        return message.voice
     document = getattr(message, "document", None)
-    mime_type = getattr(document, "mime_type", "") or ""
-    return mime_type.startswith("audio/")
+    mime = (getattr(document, "mime_type", "") or "").lower()
+    if mime.startswith("video/") or mime.startswith("audio/"):
+        return document
+    return None
 
 
-def audio_size(message: Any) -> int:
-    media = getattr(message, "audio", None) or getattr(message, "voice", None)
-    media = media or getattr(message, "document", None)
-    return int(getattr(media, "file_size", 0) or 0)
-
-
-def safe_name(message: Any) -> str:
-    media = getattr(message, "audio", None) or getattr(message, "voice", None)
-    media = media or getattr(message, "document", None)
-    name = getattr(media, "file_name", None) or f"track_{message.id}.bin"
+def media_filename(message: Any) -> str:
+    media = media_from_message(message)
+    name = getattr(media, "file_name", None) or f"media_{message.id}.mp4"
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", name)[:120]
 
 
-class VoiceMusicBot:
+class GroupMusicBot:
     def __init__(self) -> None:
         self.bot = PyrogramClient(
             "bot",
@@ -94,175 +99,193 @@ class VoiceMusicBot:
             connection_retries=10,
             retry_delay=5,
         )
-        self.calls = PyTgCalls(self.user)
-        self.pending_source: asyncio.Queue[Any] = asyncio.Queue()
-        self.current: dict[str, Any] | None = None
-        self.started_at: float | None = None
-        self._stop_event = asyncio.Event()
+        self.calls: PyTgCalls | None = None
+        self.queue: asyncio.Queue[Path] = asyncio.Queue()
+        self.player_task: asyncio.Task[None] | None = None
+        self.current: Path | None = None
+        self.stop_requested = False
 
-    async def send_status(self, text: str) -> None:
-        await self.bot.send_message(TARGET_CHAT_ID, text)
-
-    async def on_source_audio(self, event: Any) -> None:
-        message = event.message
-        sender = await event.get_sender()
-        sender_username = (getattr(sender, "username", "") or "").lower().lstrip("@")
-        if (
-            sender_username == SOURCE_DOWNLOADER_USERNAME
-            and is_audio_message(message)
-        ):
-            await self.pending_source.put(message)
-
-    async def wait_for_source_audio(self) -> Any:
-        deadline = time.monotonic() + SOURCE_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            remaining = max(0.1, deadline - time.monotonic())
-            try:
-                return await asyncio.wait_for(
-                    self.pending_source.get(), timeout=remaining
-                )
-            except asyncio.TimeoutError:
-                break
-        raise TimeoutError("لم يصل ملف صوتي من مجموعة المصدر خلال المهلة المحددة.")
-
-    async def download_source_audio(self, message: Any) -> Path:
-        size = audio_size(message)
-        if size and size > MAX_AUDIO_MB * 1024 * 1024:
-            raise ValueError(f"حجم الملف أكبر من الحد المسموح ({MAX_AUDIO_MB}MB).")
-        path = DOWNLOAD_DIR / f"{message.id}_{safe_name(message)}"
-        await self.user.download_media(message, file=str(path))
-        return path
-
-    async def play(self, path: Path) -> None:
-        # MediaStream is configured with audio only. The user account is required
-        # because Telegram voice chats cannot be joined by bot accounts.
-        await self.calls.play(
-            TARGET_CHAT_ID,
-            MediaStream(str(path), audio_parameters=AudioQuality.STUDIO),
-        )
-        self.current = {"path": path, "title": path.name}
-        self.started_at = time.monotonic()
-
-    async def stop(self) -> bool:
-        if not self.current:
-            return False
-        with contextlib.suppress(Exception):
-            await self.calls.leave_call(TARGET_CHAT_ID)
-        path = self.current.get("path")
-        if isinstance(path, Path):
-            path.unlink(missing_ok=True)
-        self.current = None
-        self.started_at = None
-        return True
-
-    async def request_and_play(self, query: str) -> None:
-        # Empty old results before asking the source downloader.
-        while not self.pending_source.empty():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self.pending_source.get_nowait()
-
-        # The user session sends the request because @W60yBot must receive it
-        # from a normal Telegram account, not from another bot.
-        await self.user.send_message(
-            SOURCE_CHAT_ID,
-            f"{SOURCE_REQUEST_PREFIX} {query}",
-        )
-        source_message = await self.wait_for_source_audio()
-        path = await self.download_source_audio(source_message)
-        try:
-            await self.bot.send_audio(
-                TARGET_CHAT_ID,
-                audio=str(path),
-                caption=f"تم تجهيز الصوت: {query}",
-            )
-            await self.play(path)
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-
-    async def is_group_admin(self, user_id: int) -> bool:
+    async def is_admin(self, user_id: int) -> bool:
         try:
             member = await self.bot.get_chat_member(TARGET_CHAT_ID, user_id)
             status = str(member.status).lower()
             return status.endswith("owner") or status.endswith("administrator")
         except Exception:
-            log.exception("Could not verify group administrator status")
+            log.exception("Could not check group admin status")
             return False
 
-    def register_handlers(self) -> None:
-        @self.bot.on_message(filters.chat(TARGET_CHAT_ID) & filters.text)
-        async def command_handler(_client: Any, message: Any) -> None:
-            user = message.from_user
-            if not user or not await self.is_group_admin(user.id):
-                return
-            text = (message.text or message.caption or "").strip()
-            parts = text.split(maxsplit=1)
-            command = parts[0].lstrip("/").lower() if parts else ""
-            if command not in {"شغل", "play", "وقف", "stop", "حالة", "status"}:
-                return
+    async def get_reply_media(self, message: Any) -> Any | None:
+        reply = message.reply_to_message
+        if reply is None and message.reply_to_message_id:
+            reply = await self.bot.get_messages(
+                TARGET_CHAT_ID, message.reply_to_message_id
+            )
+        return reply if reply and media_from_message(reply) else None
 
-            if command in {"وقف", "stop"}:
-                stopped = await self.stop()
-                await message.reply_text(
-                    "تم إيقاف التشغيل الصوتي." if stopped else "لا يوجد تشغيل حاليًا."
-                )
-                return
+    async def download_media(self, message: Any) -> Path:
+        media = media_from_message(message)
+        size = int(getattr(media, "file_size", 0) or 0)
+        if size > MAX_MEDIA_MB * 1024 * 1024:
+            raise ValueError(f"حجم الملف أكبر من {MAX_MEDIA_MB} ميغابايت.")
 
-            if command in {"حالة", "status"}:
-                if not self.current:
-                    await message.reply_text("لا يوجد صوت يعمل حاليًا.")
-                    return
-                elapsed = int(time.monotonic() - (self.started_at or time.monotonic()))
-                await message.reply_text(
-                    f"التشغيل الحالي: {self.current['title']}\n"
-                    f"المدة منذ البدء: {elapsed // 60}د {elapsed % 60}ث"
-                )
-                return
+        path = DOWNLOAD_DIR / f"{message.id}_{media_filename(message)}"
+        downloaded = await self.bot.download_media(message, file_name=str(path))
+        if not downloaded or not path.exists():
+            raise RuntimeError("فشل تنزيل الملف من تيليجرام.")
+        return path
 
-            if len(parts) < 2 or not parts[1].strip():
-                await message.reply_text("الاستخدام: شغل اسم الأغنية أو رابطها")
-                return
+    async def media_duration(self, path: Path) -> float:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        output, _ = await process.communicate()
+        try:
+            return max(1.0, float(output.decode().strip()))
+        except (ValueError, UnicodeDecodeError):
+            return 3600.0
 
-            query = parts[1].strip()
-            status = await message.reply_text("جاري طلب الصوت من مجموعة المصدر...")
+    async def player_loop(self) -> None:
+        while True:
+            path = await self.queue.get()
+            self.current = path
             try:
-                await self.stop()
-                await self.request_and_play(query)
-                await status.edit_text("تم تشغيل الصوت في المحادثة الصوتية.")
-            except TimeoutError as exc:
-                await status.edit_text(str(exc))
-            except Exception:
-                log.exception("Playback failed")
-                await status.edit_text(
-                    "تعذر التشغيل. تأكد من صلاحيات الحساب، وأن المحادثة الصوتية مفتوحة."
+                if self.calls is None:
+                    raise RuntimeError("Voice call client is not started.")
+                await self.calls.play(
+                    TARGET_CHAT_ID,
+                    MediaStream(str(path), audio_parameters=AudioQuality.STUDIO),
                 )
+                duration = await self.media_duration(path)
+                log.info("Playing %s for %.1f seconds", path.name, duration)
+                await asyncio.sleep(duration + 1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Could not play %s", path)
+                with contextlib.suppress(Exception):
+                    await self.bot.send_message(
+                        TARGET_CHAT_ID,
+                        "تعذر تشغيل هذا الملف. تأكد من فتح المحادثة الصوتية.",
+                    )
+            finally:
+                path.unlink(missing_ok=True)
+                self.current = None
+                self.queue.task_done()
+
+    async def stop_playback(self) -> bool:
+        had_media = self.current is not None or not self.queue.empty()
+        self.stop_requested = True
+        while not self.queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                path = self.queue.get_nowait()
+                path.unlink(missing_ok=True)
+                self.queue.task_done()
+
+        if self.player_task and not self.player_task.done():
+            self.player_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.player_task
+        self.player_task = None
+
+        if self.calls is not None:
+            with contextlib.suppress(Exception):
+                await self.calls.leave_call(TARGET_CHAT_ID)
+        if self.current:
+            self.current.unlink(missing_ok=True)
+            self.current = None
+        return had_media
+
+    async def handle_message(self, _client: Any, message: Any) -> None:
+        if not message.from_user or not await self.is_admin(message.from_user.id):
+            return
+
+        text = (message.text or "").strip()
+        command = clean_command(text)
+
+        if command in STOP_WORDS:
+            stopped = await self.stop_playback()
+            await message.reply_text(
+                "تم إيقاف التشغيل وتفريغ القائمة."
+                if stopped
+                else "لا يوجد تشغيل حاليًا."
+            )
+            return
+
+        if command in STATUS_WORDS:
+            if self.current:
+                await message.reply_text(f"يعمل الآن: {self.current.name}")
+            elif not self.queue.empty():
+                await message.reply_text("لا يوجد ملف يعمل حاليًا، توجد ملفات في القائمة.")
+            else:
+                await message.reply_text("القائمة فارغة.")
+            return
+
+        if command not in PLAY_WORDS:
+            if command in {"/start", "start"}:
+                await message.reply_text(
+                    "أهلًا بك في بوت ميوزك\n"
+                    "لل تشغيل: رد على فيديو أو صوت بكلمة شغل\n"
+                    "للإيقاف: اكتب ايقاف",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("مطور البوت", url=DEVELOPER_URL)]]
+                    ),
+                )
+            return
+
+        media_message = await self.get_reply_media(message)
+        if not media_message:
+            await message.reply_text("يجب كتابة شغل كرد على فيديو أو ملف صوتي.")
+            return
+
+        status = await message.reply_text("جاري تحميل الملف وإضافته إلى القائمة...")
+        try:
+            path = await self.download_media(media_message)
+            self.stop_requested = False
+            await self.queue.put(path)
+            if self.player_task is None or self.player_task.done():
+                self.player_task = asyncio.create_task(self.player_loop())
+            await status.edit_text("تمت إضافة الملف، وسيعمل تلقائيًا بالترتيب.")
+        except Exception:
+            log.exception("Download failed")
+            await status.edit_text("فشل تحميل الملف. تأكد من صلاحيات البوت وحجم الملف.")
 
     async def run(self) -> None:
-        self.register_handlers()
+        self.bot.add_handler(
+            # A group-only text handler keeps commands out of private chats.
+            MessageHandler(
+                self.handle_message,
+                filters.chat(TARGET_CHAT_ID) & filters.group & filters.text,
+            )
+        )
         await self.user.connect()
         if not await self.user.is_user_authorized():
-            raise RuntimeError(
-                "SESSION_STRING غير مصادق عليه. أنشئ StringSession بالحساب المطلوب أولًا."
-            )
+            raise RuntimeError("SESSION_STRING غير مصادق عليه.")
         await self.bot.start()
-        self.user.add_event_handler(
-            self.on_source_audio,
-            events.NewMessage(chats=SOURCE_CHAT_ID),
-        )
+        self.calls = PyTgCalls(self.user)
         await self.calls.start()
-        log.info("Bot is running. Target chat: %s", TARGET_CHAT_ID)
+        log.info("Music bot is running in target group %s", TARGET_CHAT_ID)
         try:
-            await self._stop_event.wait()
+            await asyncio.Event().wait()
         finally:
-            await self.stop()
-            with contextlib.suppress(Exception):
-                await self.calls.stop()
+            await self.stop_playback()
+            if self.calls:
+                with contextlib.suppress(Exception):
+                    await self.calls.stop()
             await self.bot.stop()
             await self.user.disconnect()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(VoiceMusicBot().run())
+        asyncio.run(GroupMusicBot().run())
     except KeyboardInterrupt:
         log.info("Stopped by user.")
