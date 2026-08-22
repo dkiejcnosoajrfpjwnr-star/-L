@@ -43,7 +43,9 @@ API_HASH = required("API_HASH")
 BOT_TOKEN = required("BOT_TOKEN")
 SESSION_STRING = required("SESSION_STRING")
 TARGET_CHAT_ID = int(required("TARGET_CHAT_ID"))
+YOUTUBE_CHAT_ID = int(required("YOUTUBE_CHAT_ID"))
 DEVELOPER_URL = os.getenv("DEVELOPER_URL", "https://t.me/c3cccc3c")
+YOUTUBE_BOT_USERNAME = os.getenv("YOUTUBE_BOT_USERNAME", "C11BOT")
 MAX_MEDIA_MB = int(os.getenv("MAX_MEDIA_MB", "200"))
 
 DOWNLOAD_DIR = Path("downloads")
@@ -360,6 +362,105 @@ class GroupMusicBot:
         except (ValueError, UnicodeDecodeError):
             return 3600.0
 
+    async def download_youtube_audio(
+        self, response: Any, query: str
+    ) -> tuple[Path, str] | None:
+        media = media_from_message(response)
+        if media is None:
+            return None
+
+        cache_key = str(getattr(media, "id", None) or response.id)
+        cached_path = CACHE_DIR / f"{cache_key}.ogg"
+        lock = self.download_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            if cached_path.exists() and cached_path.stat().st_size > 0:
+                return cached_path, query
+
+            source_path = DOWNLOAD_DIR / f".youtube_{cache_key}_{response.id}.source"
+            source_path.unlink(missing_ok=True)
+            cached_path.unlink(missing_ok=True)
+            try:
+                downloaded = await self.user.download_media(
+                    response, file=str(source_path)
+                )
+                if not downloaded or not source_path.exists():
+                    return None
+
+                process = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-vn",
+                    "-map",
+                    "0:a:0",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "128k",
+                    str(cached_path),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, error = await process.communicate()
+                if process.returncode != 0 or not cached_path.exists():
+                    log.error(
+                        "YouTube audio conversion failed: %s",
+                        error.decode(errors="ignore")[-300:].strip(),
+                    )
+                    cached_path.unlink(missing_ok=True)
+                    return None
+                return cached_path, query
+            finally:
+                source_path.unlink(missing_ok=True)
+
+    async def wait_for_youtube_audio(self, request: Any) -> Any | None:
+        try:
+            youtube_bot = await self.user.get_entity(YOUTUBE_BOT_USERNAME)
+            youtube_bot_id = getattr(youtube_bot, "id", None)
+        except Exception:
+            log.exception("Could not resolve the YouTube helper bot")
+            return None
+
+        # The helper can send a text status before the final voice message.
+        # Polling keeps those private messages inside the source group.
+        for _ in range(60):
+            async for response in self.user.iter_messages(
+                YOUTUBE_CHAT_ID, min_id=request.id, limit=20
+            ):
+                sender = getattr(response, "sender_id", None)
+                if youtube_bot_id and sender != youtube_bot_id:
+                    continue
+                if media_from_message(response) is not None:
+                    return response
+                response_text = (response.raw_text or "").lower()
+                if any(
+                    phrase in response_text
+                    for phrase in (
+                        "لا توجد نتائج",
+                        "لا يوجد نتائج",
+                        "لم يتم العثور",
+                        "not found",
+                        "no results",
+                    )
+                ):
+                    return None
+            await asyncio.sleep(1)
+        return None
+
+    async def request_youtube_audio(self, query: str) -> tuple[Path, str] | None:
+        try:
+            request = await self.user.send_message(
+                YOUTUBE_CHAT_ID, f"يوت {query}"
+            )
+            response = await self.wait_for_youtube_audio(request)
+            if response is None:
+                return None
+            return await self.download_youtube_audio(response, query)
+        except Exception:
+            log.exception("Private YouTube helper request failed")
+            return None
+
     async def update_playback_status(
         self, track: Track, started: float, duration: float
     ) -> None:
@@ -532,6 +633,32 @@ class GroupMusicBot:
             return
 
         if command not in PLAY_WORDS:
+            return
+
+        # A play command with text after it is a private YouTube-helper
+        # request. The helper conversation never gets forwarded to the public
+        # group; only the resulting audio enters the normal queue.
+        command_parts = text.split(maxsplit=1)
+        youtube_query = command_parts[1].strip() if len(command_parts) > 1 else ""
+        if youtube_query:
+            status = await event.reply("• جار البحث عن المقطع وتشغيله ...")
+            result = await self.request_youtube_audio(youtube_query)
+            if result is None:
+                await status.edit("• لا توجد نتائج.")
+                return
+
+            path, title = result
+            waiting_before = self.queue.qsize() + (1 if self.current else 0)
+            track = Track(path=path, status_message=status, title=title)
+            await self.queue.put(track)
+            if self.player_task is None or self.player_task.done():
+                self.player_task = asyncio.create_task(self.player_loop())
+            elif self.current is not None:
+                await status.edit(
+                    f'↢ تمت إضافة "ملف صوتي" إلى قائمة التشغيل.\n'
+                    f"↢ عدد الأصوات في الانتظار: {self.queue.qsize()}",
+                    buttons=control_buttons(),
+                )
             return
 
         media_message = await self.get_reply_media(event.message)
