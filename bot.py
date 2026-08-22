@@ -60,7 +60,28 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 PLAY_WORDS = {"شغل", "تشغيل", "play", "/شغل", "/تشغيل", "/play"}
 STOP_WORDS = {"ايقاف", "إيقاف", "وقف", "stop", "/ايقاف", "/إيقاف", "/وقف", "/stop"}
 SKIP_WORDS = {"تخطي", "التالي", "skip", "/تخطي", "/التالي", "/skip"}
-STATUS_WORDS = {"حالة", "status", "/حالة", "/status"}
+STATUS_WORDS = {
+    "حالة",
+    "حاله",
+    "الحالة",
+    "الحاله",
+    "status",
+    "/حالة",
+    "/حاله",
+    "/الحالة",
+    "/الحاله",
+    "/status",
+}
+CLEAR_QUEUE_WORDS = {
+    "مسح حالة",
+    "مسح حاله",
+    "مسح الحالة",
+    "مسح الحاله",
+    "/مسح حالة",
+    "/مسح حاله",
+    "/مسح الحالة",
+    "/مسح الحاله",
+}
 
 
 @dataclass
@@ -72,6 +93,25 @@ class Track:
 
 def clean_command(text: str) -> str:
     return text.strip().split(maxsplit=1)[0].lower()
+
+
+def normalized_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, remaining = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes:02d}:{remaining:02d}"
+
+
+def progress_bar(elapsed: float, duration: float, width: int = 24) -> str:
+    ratio = min(max(elapsed / max(duration, 1), 0.0), 1.0)
+    position = min(int(ratio * (width - 1)), width - 1)
+    return "━" * position + "●" + "━" * (width - position - 1)
 
 
 def media_from_message(message: Any) -> Any | None:
@@ -320,6 +360,20 @@ class GroupMusicBot:
         except (ValueError, UnicodeDecodeError):
             return 3600.0
 
+    async def update_playback_status(
+        self, track: Track, started: float, duration: float
+    ) -> None:
+        while True:
+            elapsed = min(max(time.monotonic() - started, 0.0), duration)
+            await self.edit_status(
+                track,
+                f"• التشغيل الآن\n"
+                f"{track.title}\n"
+                f"⏱ {format_duration(elapsed)} / {format_duration(duration)}\n"
+                f"{progress_bar(elapsed, duration)}",
+            )
+            await asyncio.sleep(2)
+
     async def edit_status(self, track: Track, text: str) -> None:
         with contextlib.suppress(Exception):
             await track.status_message.edit(text, buttons=control_buttons())
@@ -341,6 +395,9 @@ class GroupMusicBot:
                     ),
                 )
                 duration = await self.media_duration(track.path)
+                progress_task = asyncio.create_task(
+                    self.update_playback_status(track, time.monotonic(), duration)
+                )
                 self.advance_event.clear()
                 try:
                     await asyncio.wait_for(
@@ -349,6 +406,10 @@ class GroupMusicBot:
                     )
                 except asyncio.TimeoutError:
                     pass
+                finally:
+                    progress_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await progress_task
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -380,9 +441,24 @@ class GroupMusicBot:
         if self.current:
             return (
                 f"• التشغيل الآن:\n{self.current.title}\n"
-                f"• طابور الانتظار: {waiting} ملف"
+                f"• قائمة الانتظار: {waiting} ملف"
             )
-        return f"• لا يوجد تشغيل\n• طابور الانتظار: {waiting} ملف"
+        return f"• لا يوجد تشغيل\n• قائمة الانتظار: {waiting} ملف"
+
+    async def clear_waiting(self) -> int:
+        removed = 0
+        while True:
+            try:
+                track = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.queue.task_done()
+            removed += 1
+            with contextlib.suppress(Exception):
+                await track.status_message.edit(
+                    "↢ تم مسح الملف من قائمة الانتظار."
+                )
+        return removed
 
     async def callback_handler(self, event: Any) -> None:
         if event.chat_id != TARGET_CHAT_ID:
@@ -411,6 +487,15 @@ class GroupMusicBot:
 
         text = (event.raw_text or "").strip()
         command = clean_command(text)
+        full_command = normalized_text(text)
+
+        if full_command in CLEAR_QUEUE_WORDS:
+            removed = await self.clear_waiting()
+            await event.reply(
+                f"↢ تم مسح قائمة الانتظار.\n"
+                f"↢ عدد الأصوات التي تم مسحها: {removed}"
+            )
+            return
 
         if command in STOP_WORDS or command in SKIP_WORDS:
             advanced = await self.advance()
@@ -423,7 +508,18 @@ class GroupMusicBot:
             )
             return
 
-        if command in STATUS_WORDS:
+        if full_command in {
+            "حالة",
+            "حاله",
+            "الحالة",
+            "الحاله",
+            "/حالة",
+            "/حاله",
+            "/الحالة",
+            "/الحاله",
+            "status",
+            "/status",
+        }:
             await event.reply(await self.status_text(), buttons=control_buttons())
             return
 
@@ -445,7 +541,9 @@ class GroupMusicBot:
 
         waiting_before = self.queue.qsize() + (1 if self.current else 0)
         status = await event.reply(
-            "• جار التشغيل" if waiting_before == 0 else "• جار التحميل ووضعه في الطابور"
+            "• جار التشغيل"
+            if waiting_before == 0
+            else "• جار التحميل ووضعه في قائمة الانتظار"
         )
         try:
             path = await self.download_media(media_message, status)
@@ -453,6 +551,12 @@ class GroupMusicBot:
             await self.queue.put(track)
             if self.player_task is None or self.player_task.done():
                 self.player_task = asyncio.create_task(self.player_loop())
+            elif self.current is not None:
+                await status.edit(
+                    f'↢ تمت إضافة "ملف صوتي" إلى قائمة التشغيل.\n'
+                    f"↢ عدد الأصوات في الانتظار: {self.queue.qsize()}",
+                    buttons=control_buttons(),
+                )
         except Exception:
             log.exception("Download failed")
             await status.edit("• فشل تحميل الملف. تأكد من الصلاحيات وحجم الفيديو.")
