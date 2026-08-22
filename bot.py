@@ -1,7 +1,7 @@
-"""Group-only Telegram music bot.
+"""Telethon-only group music bot.
 
-Admins reply to a video/audio with "شغل". The bot downloads the media, queues
-it, and the Telethon user session plays its audio in the target voice chat.
+Reply to a video or audio with "شغل". Videos are converted to audio before
+they are sent to the voice chat. New items wait in a queue and play in order.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,15 @@ SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 PLAY_WORDS = {"شغل", "تشغيل", "play", "/شغل", "/تشغيل", "/play"}
 STOP_WORDS = {"ايقاف", "إيقاف", "وقف", "stop", "/ايقاف", "/إيقاف", "/وقف", "/stop"}
+SKIP_WORDS = {"تخطي", "التالي", "skip", "/تخطي", "/التالي", "/skip"}
 STATUS_WORDS = {"حالة", "status", "/حالة", "/status"}
+
+
+@dataclass
+class Track:
+    path: Path
+    status_message: Any
+    title: str
 
 
 def clean_command(text: str) -> str:
@@ -73,22 +82,27 @@ def media_from_message(message: Any) -> Any | None:
 
 
 def media_filename(message: Any) -> str:
-    media = media_from_message(message)
     message_file = getattr(message, "file", None)
-    name = (
-        getattr(media, "file_name", None)
-        or getattr(message_file, "name", None)
-        or f"media_{message.id}.mp4"
-    )
+    name = getattr(message_file, "name", None) or f"media_{message.id}.bin"
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", name)[:120]
+
+
+def control_buttons() -> list[list[Any]]:
+    return [
+        [
+            Button.inline("إيقاف", b"music_stop"),
+            Button.inline("تخطي", b"music_skip"),
+            Button.inline("حالة", b"music_status"),
+        ]
+    ]
 
 
 class GroupMusicBot:
     def __init__(self) -> None:
         self.bot = TelegramClient(
             str(SESSION_DIR / "bot"),
-            api_id=API_ID,
-            api_hash=API_HASH,
+            API_ID,
+            API_HASH,
         )
         self.user = TelegramClient(
             StringSession(SESSION_STRING),
@@ -99,10 +113,11 @@ class GroupMusicBot:
             retry_delay=5,
         )
         self.calls: PyTgCalls | None = None
-        self.queue: asyncio.Queue[Path] = asyncio.Queue()
+        self.queue: asyncio.Queue[Track] = asyncio.Queue()
         self.player_task: asyncio.Task[None] | None = None
-        self.current: Path | None = None
-        self.stop_requested = False
+        self.current: Track | None = None
+        self.advance_event = asyncio.Event()
+        self.leave_when_empty = False
 
     async def is_admin(self, user_id: int) -> bool:
         try:
@@ -119,18 +134,43 @@ class GroupMusicBot:
     async def download_media(self, message: Any) -> Path:
         media = media_from_message(message)
         size = int(
-            getattr(media, "file_size", None)
-            or getattr(media, "size", 0)
+            getattr(media, "size", 0)
+            or getattr(media, "file_size", 0)
             or 0
         )
         if size > MAX_MEDIA_MB * 1024 * 1024:
             raise ValueError(f"حجم الملف أكبر من {MAX_MEDIA_MB} ميغابايت.")
 
-        path = DOWNLOAD_DIR / f"{message.id}_{media_filename(message)}"
-        downloaded = await self.bot.download_media(message, file=str(path))
-        if not downloaded or not path.exists():
+        original = DOWNLOAD_DIR / f"{message.id}_{media_filename(message)}"
+        downloaded = await self.bot.download_media(message, file=str(original))
+        if not downloaded or not original.exists():
             raise RuntimeError("فشل تنزيل الملف من تيليجرام.")
-        return path
+
+        # Always produce an audio-only file. This prevents a video stream from
+        # ever reaching the voice chat, even when the replied media is a video.
+        audio_path = original.with_suffix(".ogg")
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(original),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "128k",
+            str(audio_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, error = await process.communicate()
+        original.unlink(missing_ok=True)
+        if process.returncode != 0 or not audio_path.exists():
+            detail = error.decode(errors="ignore")[-300:].strip()
+            raise RuntimeError(f"تعذر استخراج الصوت من الملف. {detail}")
+        return audio_path
 
     async def media_duration(self, path: Path) -> float:
         process = await asyncio.create_subprocess_exec(
@@ -151,114 +191,152 @@ class GroupMusicBot:
         except (ValueError, UnicodeDecodeError):
             return 3600.0
 
+    async def edit_status(self, track: Track, text: str) -> None:
+        with contextlib.suppress(Exception):
+            await track.status_message.edit(text, buttons=control_buttons())
+
     async def player_loop(self) -> None:
         while True:
-            path = await self.queue.get()
-            self.current = path
+            track = await self.queue.get()
+            self.current = track
             try:
                 if self.calls is None:
                     raise RuntimeError("Voice call client is not started.")
+
+                await self.edit_status(track, f"• تم التشغيل\n{track.title}")
                 await self.calls.play(
                     TARGET_CHAT_ID,
-                    MediaStream(str(path), audio_parameters=AudioQuality.STUDIO),
+                    MediaStream(
+                        str(track.path),
+                        audio_parameters=AudioQuality.STUDIO,
+                    ),
                 )
-                duration = await self.media_duration(path)
-                log.info("Playing %s for %.1f seconds", path.name, duration)
-                await asyncio.sleep(duration + 1)
+                duration = await self.media_duration(track.path)
+                self.advance_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self.advance_event.wait(),
+                        timeout=duration + 1,
+                    )
+                except asyncio.TimeoutError:
+                    pass
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Could not play %s", path)
+                log.exception("Could not play %s", track.path)
                 with contextlib.suppress(Exception):
                     await self.bot.send_message(
                         TARGET_CHAT_ID,
-                        "تعذر تشغيل هذا الملف. تأكد من فتح المحادثة الصوتية.",
+                        "تعذر تشغيل الصوت. تأكد من فتح المحادثة الصوتية.",
                     )
             finally:
-                path.unlink(missing_ok=True)
+                track.path.unlink(missing_ok=True)
                 self.current = None
                 self.queue.task_done()
 
-    async def stop_playback(self) -> bool:
-        had_media = self.current is not None or not self.queue.empty()
-        self.stop_requested = True
-        while not self.queue.empty():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                path = self.queue.get_nowait()
-                path.unlink(missing_ok=True)
-                self.queue.task_done()
+                if self.leave_when_empty and self.queue.empty():
+                    self.leave_when_empty = False
+                    if self.calls is not None:
+                        with contextlib.suppress(Exception):
+                            await self.calls.leave_call(TARGET_CHAT_ID)
 
-        if self.player_task and not self.player_task.done():
-            self.player_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.player_task
-        self.player_task = None
+    async def advance(self) -> bool:
+        if self.current is None:
+            return False
+        self.leave_when_empty = self.queue.empty()
+        self.advance_event.set()
+        return True
 
-        if self.calls is not None:
-            with contextlib.suppress(Exception):
-                await self.calls.leave_call(TARGET_CHAT_ID)
+    async def status_text(self) -> str:
+        waiting = self.queue.qsize()
         if self.current:
-            self.current.unlink(missing_ok=True)
-            self.current = None
-        return had_media
+            return (
+                f"• التشغيل الآن:\n{self.current.title}\n"
+                f"• طابور الانتظار: {waiting} ملف"
+            )
+        return f"• لا يوجد تشغيل\n• طابور الانتظار: {waiting} ملف"
+
+    async def callback_handler(self, event: Any) -> None:
+        if event.chat_id != TARGET_CHAT_ID:
+            return
+        if not event.sender_id or not await self.is_admin(event.sender_id):
+            await event.answer("هذا الزر للمشرفين فقط.", alert=True)
+            return
+
+        action = event.data
+        if action in {b"music_stop", b"music_skip"}:
+            advanced = await self.advance()
+            await event.answer(
+                "تم الانتقال للملف التالي."
+                if advanced and not self.leave_when_empty
+                else "تم إيقاف التشغيل ومغادرة الاستيج."
+                if advanced
+                else "لا يوجد ملف يعمل حاليًا.",
+                alert=False,
+            )
+        elif action == b"music_status":
+            await event.answer(await self.status_text(), alert=True)
 
     async def handle_message(self, event: Any) -> None:
-        message = event.message
         if not event.sender_id or not await self.is_admin(event.sender_id):
             return
 
         text = (event.raw_text or "").strip()
         command = clean_command(text)
 
-        if command in STOP_WORDS:
-            stopped = await self.stop_playback()
+        if command in STOP_WORDS or command in SKIP_WORDS:
+            advanced = await self.advance()
             await event.reply(
-                "تم إيقاف التشغيل وتفريغ القائمة."
-                if stopped
-                else "لا يوجد تشغيل حاليًا."
+                "• تم الانتقال للملف التالي."
+                if advanced and not self.leave_when_empty
+                else "• تم إيقاف التشغيل ومغادرة الاستيج."
+                if advanced
+                else "• لا يوجد ملف يعمل حاليًا."
             )
             return
 
         if command in STATUS_WORDS:
-            if self.current:
-                await event.reply(f"يعمل الآن: {self.current.name}")
-            elif not self.queue.empty():
-                await event.reply("لا يوجد ملف يعمل حاليًا، توجد ملفات في القائمة.")
-            else:
-                await event.reply("القائمة فارغة.")
+            await event.reply(await self.status_text(), buttons=control_buttons())
+            return
+
+        if command in {"/start", "start"}:
+            await event.reply(
+                "أهلًا بك في بوت ميوزك\n"
+                "رد على فيديو أو صوت بكلمة شغل للتشغيل.",
+                buttons=[[Button.url("مطور البوت", DEVELOPER_URL)]],
+            )
             return
 
         if command not in PLAY_WORDS:
-            if command in {"/start", "start"}:
-                await event.reply(
-                    "أهلًا بك في بوت ميوزك\n"
-                    "لل تشغيل: رد على فيديو أو صوت بكلمة شغل\n"
-                    "للإيقاف: اكتب ايقاف",
-                    buttons=[[Button.url("مطور البوت", DEVELOPER_URL)]],
-                )
             return
 
-        media_message = await self.get_reply_media(message)
+        media_message = await self.get_reply_media(event.message)
         if not media_message:
-            await event.reply("يجب كتابة شغل كرد على فيديو أو ملف صوتي.")
+            await event.reply("• يجب أن ترد بكلمة شغل على فيديو أو ملف صوتي.")
             return
 
-        status = await event.reply("جاري تحميل الملف وإضافته إلى القائمة...")
+        waiting_before = self.queue.qsize() + (1 if self.current else 0)
+        status = await event.reply(
+            "• جار التشغيل" if waiting_before == 0 else "• جار التحميل ووضعه في الطابور"
+        )
         try:
             path = await self.download_media(media_message)
-            self.stop_requested = False
-            await self.queue.put(path)
+            track = Track(path=path, status_message=status, title=media_filename(media_message))
+            await self.queue.put(track)
             if self.player_task is None or self.player_task.done():
                 self.player_task = asyncio.create_task(self.player_loop())
-            await status.edit("تمت إضافة الملف، وسيعمل تلقائيًا بالترتيب.")
         except Exception:
             log.exception("Download failed")
-            await status.edit("فشل تحميل الملف. تأكد من صلاحيات البوت وحجم الملف.")
+            await status.edit("• فشل تحميل الملف. تأكد من الصلاحيات وحجم الفيديو.")
 
     async def run(self) -> None:
         self.bot.add_event_handler(
             self.handle_message,
             events.NewMessage(chats=TARGET_CHAT_ID),
+        )
+        self.bot.add_event_handler(
+            self.callback_handler,
+            events.CallbackQuery(),
         )
         await self.user.connect()
         if not await self.user.is_user_authorized():
@@ -270,7 +348,10 @@ class GroupMusicBot:
         try:
             await asyncio.Event().wait()
         finally:
-            await self.stop_playback()
+            if self.player_task and not self.player_task.done():
+                self.player_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.player_task
             if self.calls:
                 with contextlib.suppress(Exception):
                     await self.calls.stop()
