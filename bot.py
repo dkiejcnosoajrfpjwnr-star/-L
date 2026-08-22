@@ -110,12 +110,6 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{remaining:02d}"
 
 
-def progress_bar(elapsed: float, duration: float, width: int = 24) -> str:
-    ratio = min(max(elapsed / max(duration, 1), 0.0), 1.0)
-    position = min(int(ratio * (width - 1)), width - 1)
-    return "━" * position + "●" + "━" * (width - position - 1)
-
-
 def media_from_message(message: Any) -> Any | None:
     if getattr(message, "video", None):
         return message.video
@@ -212,36 +206,6 @@ class GroupMusicBot:
             )
             temporary_source.unlink(missing_ok=True)
 
-            downloaded_bytes = 0
-            progress_lock = asyncio.Lock()
-            last_progress = 0.0
-
-            async def show_progress() -> None:
-                nonlocal last_progress
-                now = time.monotonic()
-                if now - last_progress < 5:
-                    return
-                async with progress_lock:
-                    now = time.monotonic()
-                    if now - last_progress < 5:
-                        return
-                    last_progress = now
-                    elapsed = max(now - started, 0.001)
-                    speed = downloaded_bytes / elapsed
-                    if size:
-                        percent = min(downloaded_bytes * 100 / size, 100)
-                        text = (
-                            "• جار التحميل بسرعة\n"
-                            f"{percent:.1f}% | {speed / 1024 / 1024:.2f} MB/s"
-                        )
-                    else:
-                        text = (
-                            "• جار التحميل بسرعة\n"
-                            f"{downloaded_bytes / 1024 / 1024:.1f} MB"
-                        )
-                    with contextlib.suppress(Exception):
-                        await status_message.edit(text)
-
             # Split large files into aligned ranges and download the ranges
             # concurrently, matching the fast strategy in the supplied file.
             parts: list[tuple[int, int]] = []
@@ -270,7 +234,6 @@ class GroupMusicBot:
             async def download_part(
                 index: int, offset: int, limit: int
             ) -> None:
-                nonlocal downloaded_bytes
                 written = 0
                 with temporary_parts[index].open("wb") as output:
                     iterator = self.bot.iter_download(
@@ -286,8 +249,6 @@ class GroupMusicBot:
                         data = chunk[:remaining]
                         output.write(data)
                         written += len(data)
-                        downloaded_bytes += len(data)
-                        await show_progress()
 
                 if limit and written != limit:
                     raise RuntimeError(
@@ -461,20 +422,6 @@ class GroupMusicBot:
             log.exception("Private YouTube helper request failed")
             return None
 
-    async def update_playback_status(
-        self, track: Track, started: float, duration: float
-    ) -> None:
-        while True:
-            elapsed = min(max(time.monotonic() - started, 0.0), duration)
-            await self.edit_status(
-                track,
-                f"• التشغيل الآن\n"
-                f"{track.title}\n"
-                f"⏱ {format_duration(elapsed)} / {format_duration(duration)}\n"
-                f"{progress_bar(elapsed, duration)}",
-            )
-            await asyncio.sleep(2)
-
     async def edit_status(self, track: Track, text: str) -> None:
         with contextlib.suppress(Exception):
             await track.status_message.edit(text, buttons=control_buttons())
@@ -496,9 +443,6 @@ class GroupMusicBot:
                     ),
                 )
                 duration = await self.media_duration(track.path)
-                progress_task = asyncio.create_task(
-                    self.update_playback_status(track, time.monotonic(), duration)
-                )
                 self.advance_event.clear()
                 try:
                     await asyncio.wait_for(
@@ -507,10 +451,6 @@ class GroupMusicBot:
                     )
                 except asyncio.TimeoutError:
                     pass
-                finally:
-                    progress_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await progress_task
             except asyncio.CancelledError:
                 raise
             except Exception:
