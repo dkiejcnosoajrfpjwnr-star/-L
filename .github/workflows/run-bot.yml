@@ -19,6 +19,7 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       SESSION_STRING: ${{ secrets.SESSION_STRING }}
       TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+      YOUTUBE_CHAT_ID: ${{ secrets.YOUTUBE_CHAT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
