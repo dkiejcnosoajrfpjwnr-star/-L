@@ -32,8 +32,7 @@ jobs:
         shell: bash
         run: |
           # Restart the bot every 5 hours and 30 minutes, or immediately
-          # after an unexpected exit. GitHub Actions will stop the job at
-          # its platform limit, then the schedule starts it again.
+          # after an unexpected exit.
           while true; do
             timeout --signal=TERM 19800 python bot.py
             exit_code=$?
