@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,12 @@ DOWNLOAD_DIR = Path("downloads")
 SESSION_DIR = Path("sessions")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# Faster Telegram downloads and persistent audio cache.
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+PARALLEL_DOWNLOAD_WORKERS = 4
+CACHE_DIR = DOWNLOAD_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 PLAY_WORDS = {"شغل", "تشغيل", "play", "/شغل", "/تشغيل", "/play"}
 STOP_WORDS = {"ايقاف", "إيقاف", "وقف", "stop", "/ايقاف", "/إيقاف", "/وقف", "/stop"}
@@ -118,6 +125,7 @@ class GroupMusicBot:
         self.current: Track | None = None
         self.advance_event = asyncio.Event()
         self.leave_when_empty = False
+        self.download_locks: dict[str, asyncio.Lock] = {}
 
     async def is_admin(self, user_id: int) -> bool:
         try:
@@ -131,8 +139,11 @@ class GroupMusicBot:
         reply = await message.get_reply_message()
         return reply if reply and media_from_message(reply) else None
 
-    async def download_media(self, message: Any) -> Path:
+    async def download_media(self, message: Any, status_message: Any) -> Path:
         media = media_from_message(message)
+        if media is None:
+            raise ValueError("الرسالة لا تحتوي على ملف صوتي أو فيديو.")
+
         size = int(
             getattr(media, "size", 0)
             or getattr(media, "file_size", 0)
@@ -141,36 +152,154 @@ class GroupMusicBot:
         if size > MAX_MEDIA_MB * 1024 * 1024:
             raise ValueError(f"حجم الملف أكبر من {MAX_MEDIA_MB} ميغابايت.")
 
-        original = DOWNLOAD_DIR / f"{message.id}_{media_filename(message)}"
-        downloaded = await self.bot.download_media(message, file=str(original))
-        if not downloaded or not original.exists():
-            raise RuntimeError("فشل تنزيل الملف من تيليجرام.")
+        # Telegram's media id is stable when the same file is sent again.
+        # The converted OGG is cached, so repeat plays skip both download and
+        # ffmpeg conversion.
+        cache_key = str(getattr(media, "id", None) or message.id)
+        cached_path = CACHE_DIR / f"{cache_key}.ogg"
+        lock = self.download_locks.setdefault(cache_key, asyncio.Lock())
 
-        # Always produce an audio-only file. This prevents a video stream from
-        # ever reaching the voice chat, even when the replied media is a video.
-        audio_path = original.with_suffix(".ogg")
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(original),
-            "-vn",
-            "-map",
-            "0:a:0",
-            "-c:a",
-            "libopus",
-            "-b:a",
-            "128k",
-            str(audio_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, error = await process.communicate()
-        original.unlink(missing_ok=True)
-        if process.returncode != 0 or not audio_path.exists():
-            detail = error.decode(errors="ignore")[-300:].strip()
-            raise RuntimeError(f"تعذر استخراج الصوت من الملف. {detail}")
-        return audio_path
+        async with lock:
+            if cached_path.exists() and cached_path.stat().st_size > 0:
+                log.info("Using cached media %s", cached_path)
+                return cached_path
+
+            started = time.monotonic()
+            temporary_source = DOWNLOAD_DIR / (
+                f".{cache_key}_{message.id}_{media_filename(message)}.part"
+            )
+            temporary_source.unlink(missing_ok=True)
+
+            downloaded_bytes = 0
+            progress_lock = asyncio.Lock()
+            last_progress = 0.0
+
+            async def show_progress() -> None:
+                nonlocal last_progress
+                now = time.monotonic()
+                if now - last_progress < 5:
+                    return
+                async with progress_lock:
+                    now = time.monotonic()
+                    if now - last_progress < 5:
+                        return
+                    last_progress = now
+                    elapsed = max(now - started, 0.001)
+                    speed = downloaded_bytes / elapsed
+                    if size:
+                        percent = min(downloaded_bytes * 100 / size, 100)
+                        text = (
+                            "• جار التحميل بسرعة\n"
+                            f"{percent:.1f}% | {speed / 1024 / 1024:.2f} MB/s"
+                        )
+                    else:
+                        text = (
+                            "• جار التحميل بسرعة\n"
+                            f"{downloaded_bytes / 1024 / 1024:.1f} MB"
+                        )
+                    with contextlib.suppress(Exception):
+                        await status_message.edit(text)
+
+            # Split large files into aligned ranges and download the ranges
+            # concurrently, matching the fast strategy in the supplied file.
+            parts: list[tuple[int, int]] = []
+            if size >= DOWNLOAD_CHUNK_SIZE * PARALLEL_DOWNLOAD_WORKERS:
+                aligned = (
+                    size // PARALLEL_DOWNLOAD_WORKERS // DOWNLOAD_CHUNK_SIZE
+                ) * DOWNLOAD_CHUNK_SIZE
+                aligned = max(aligned, DOWNLOAD_CHUNK_SIZE)
+                for index in range(PARALLEL_DOWNLOAD_WORKERS):
+                    offset = index * aligned
+                    if offset >= size:
+                        break
+                    limit = (
+                        aligned
+                        if index < PARALLEL_DOWNLOAD_WORKERS - 1
+                        else size - offset
+                    )
+                    parts.append((offset, limit))
+            else:
+                parts = [(0, size)] if size else [(0, 0)]
+
+            temporary_parts = [
+                Path(f"{temporary_source}.{index}") for index in range(len(parts))
+            ]
+
+            async def download_part(
+                index: int, offset: int, limit: int
+            ) -> None:
+                nonlocal downloaded_bytes
+                written = 0
+                with temporary_parts[index].open("wb") as output:
+                    iterator = self.bot.iter_download(
+                        message.media,
+                        offset=offset,
+                        limit=limit or None,
+                        request_size=DOWNLOAD_CHUNK_SIZE,
+                    )
+                    async for chunk in iterator:
+                        remaining = limit - written if limit else len(chunk)
+                        if remaining <= 0:
+                            break
+                        data = chunk[:remaining]
+                        output.write(data)
+                        written += len(data)
+                        downloaded_bytes += len(data)
+                        await show_progress()
+
+                if limit and written != limit:
+                    raise RuntimeError(
+                        f"اكتمل تنزيل جزء غير كامل ({written}/{limit} بايت)."
+                    )
+
+            try:
+                await asyncio.gather(
+                    *(
+                        download_part(index, offset, limit)
+                        for index, (offset, limit) in enumerate(parts)
+                    )
+                )
+                with temporary_source.open("wb") as output:
+                    for part in temporary_parts:
+                        with part.open("rb") as input_file:
+                            while data := input_file.read(DOWNLOAD_CHUNK_SIZE):
+                                output.write(data)
+                        part.unlink(missing_ok=True)
+
+                process = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(temporary_source),
+                    "-vn",
+                    "-map",
+                    "0:a:0",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "128k",
+                    str(cached_path),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, error = await process.communicate()
+                if process.returncode != 0 or not cached_path.exists():
+                    detail = error.decode(errors="ignore")[-300:].strip()
+                    raise RuntimeError(f"تعذر استخراج الصوت من الملف. {detail}")
+
+                log.info(
+                    "Downloaded and cached media %s in %.2fs",
+                    cache_key,
+                    time.monotonic() - started,
+                )
+                return cached_path
+            except Exception:
+                cached_path.unlink(missing_ok=True)
+                raise
+            finally:
+                temporary_source.unlink(missing_ok=True)
+                for part in temporary_parts:
+                    part.unlink(missing_ok=True)
 
     async def media_duration(self, path: Path) -> float:
         process = await asyncio.create_subprocess_exec(
@@ -230,7 +359,6 @@ class GroupMusicBot:
                         "تعذر تشغيل الصوت. تأكد من فتح المحادثة الصوتية.",
                     )
             finally:
-                track.path.unlink(missing_ok=True)
                 self.current = None
                 self.queue.task_done()
 
@@ -320,7 +448,7 @@ class GroupMusicBot:
             "• جار التشغيل" if waiting_before == 0 else "• جار التحميل ووضعه في الطابور"
         )
         try:
-            path = await self.download_media(media_message)
+            path = await self.download_media(media_message, status)
             track = Track(path=path, status_message=status, title=media_filename(media_message))
             await self.queue.put(track)
             if self.player_task is None or self.player_task.done():
