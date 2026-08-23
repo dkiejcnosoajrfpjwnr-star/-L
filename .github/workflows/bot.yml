@@ -32,11 +32,20 @@ jobs:
       - name: Start bot
         shell: bash
         run: |
-          # Restart the bot every 5 hours and 30 minutes, or immediately
-          # after an unexpected exit.
-          while true; do
-            timeout --signal=TERM 19800 python bot.py
-            exit_code=$?
-            echo "bot.py exited with code ${exit_code}; restarting in 10 seconds"
-            sleep 10
-          done
+          # Let the workflow restart the bot after 5 hours and 30 minutes.
+          set +e
+          timeout --signal=TERM 19800 python bot.py
+          exit_code=$?
+          echo "bot.py exited with code ${exit_code}; starting a fresh workflow"
+
+      # ─── إعادة تشغيل البوت فوراً بعد الانتهاء (يقلل التأخير إلى ~30 ثانية) ───
+      - name: Auto-restart bot
+        # لا تعِد تشغيله إذا كان GitHub قد ألغى هذا التشغيل
+        # بسبب بدء تشغيل أحدث.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh workflow run run-bot.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ github.ref_name }}
