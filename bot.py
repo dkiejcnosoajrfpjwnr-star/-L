@@ -189,10 +189,11 @@ class GroupMusicBot:
             raise ValueError(f"حجم الملف أكبر من {MAX_MEDIA_MB} ميغابايت.")
 
         # Telegram's media id is stable when the same file is sent again.
-        # The converted OGG is cached, so repeat plays skip both download and
-        # ffmpeg conversion.
+        # Keep the original media instead of converting it to OGG.
         cache_key = str(getattr(media, "id", None) or message.id)
-        cached_path = CACHE_DIR / f"{cache_key}.ogg"
+        original_name = media_filename(message)
+        original_suffix = Path(original_name).suffix or ".media"
+        cached_path = CACHE_DIR / f"{cache_key}{original_suffix}"
         lock = self.download_locks.setdefault(cache_key, asyncio.Lock())
 
         async with lock:
@@ -269,29 +270,10 @@ class GroupMusicBot:
                                 output.write(data)
                         part.unlink(missing_ok=True)
 
-                process = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(temporary_source),
-                    "-vn",
-                    "-map",
-                    "0:a:0",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    "128k",
-                    str(cached_path),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, error = await process.communicate()
-                if process.returncode != 0 or not cached_path.exists():
-                    detail = error.decode(errors="ignore")[-300:].strip()
-                    raise RuntimeError(f"تعذر استخراج الصوت من الملف. {detail}")
+                temporary_source.replace(cached_path)
 
                 log.info(
-                    "Downloaded and cached media %s in %.2fs",
+                    "Downloaded and cached original media %s in %.2fs",
                     cache_key,
                     time.monotonic() - started,
                 )
@@ -331,7 +313,9 @@ class GroupMusicBot:
             return None
 
         cache_key = str(getattr(media, "id", None) or response.id)
-        cached_path = CACHE_DIR / f"{cache_key}.ogg"
+        original_name = media_filename(response)
+        original_suffix = Path(original_name).suffix or ".media"
+        cached_path = CACHE_DIR / f"{cache_key}{original_suffix}"
         lock = self.download_locks.setdefault(cache_key, asyncio.Lock())
         async with lock:
             if cached_path.exists() and cached_path.stat().st_size > 0:
@@ -347,30 +331,7 @@ class GroupMusicBot:
                 if not downloaded or not source_path.exists():
                     return None
 
-                process = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(source_path),
-                    "-vn",
-                    "-map",
-                    "0:a:0",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    "128k",
-                    str(cached_path),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, error = await process.communicate()
-                if process.returncode != 0 or not cached_path.exists():
-                    log.error(
-                        "YouTube audio conversion failed: %s",
-                        error.decode(errors="ignore")[-300:].strip(),
-                    )
-                    cached_path.unlink(missing_ok=True)
-                    return None
+                source_path.replace(cached_path)
                 return cached_path, query
             finally:
                 source_path.unlink(missing_ok=True)
