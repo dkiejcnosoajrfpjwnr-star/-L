@@ -1,9 +1,7 @@
-name: Run Telegram voice bot
+name: Run Bot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"
 
 concurrency:
   group: telegram-voice-bot
@@ -32,16 +30,12 @@ jobs:
       - name: Start bot
         shell: bash
         run: |
-          # Let the workflow restart the bot after 5 hours and 30 minutes.
           set +e
           timeout --signal=TERM 19800 python bot.py
           exit_code=$?
           echo "bot.py exited with code ${exit_code}; starting a fresh workflow"
 
-      # ─── إعادة تشغيل البوت فوراً بعد الانتهاء (يقلل التأخير إلى ~30 ثانية) ───
       - name: Auto-restart bot
-        # لا تعِد تشغيله إذا كان GitHub قد ألغى هذا التشغيل
-        # بسبب بدء تشغيل أحدث.
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
